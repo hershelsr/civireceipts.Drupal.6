@@ -1,0 +1,1040 @@
+<?php // vim: set filetype=php expandtab tabstop=2 shiftwidth=2 autoindent smartindent
+
+/*
+
+DROP TABLE IF EXISTS `civicrm_receipt_emails`;
+
+CREATE TABLE `civicrm_receipt_emails` (
+  `contribution_id` int(11) NOT NULL,
+  `viewed` datetime DEFAULT NULL,
+  `civicrm_receipt_emails_type` int(11) DEFAULT NULL,
+  PRIMARY KEY (`contribution_id`,`civicrm_receipt_emails_type` )
+)  ;
+
+DROP TABLE IF EXISTS `civicrm_receipt_emails_types`;
+
+CREATE TABLE `civicrm_receipt_emails_types` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `name` varchar(50) COLLATE latin1_general_ci DEFAULT NULL,
+  PRIMARY KEY (`id`)
+)  ;
+
+insert  into `civicrm_receipt_emails_types`(`id`,`name`) values (1,'Thank you'),(2,'Receipt'),(3,'Invoice'),(4,'Honor Of'),(5,'Honor of with NO amount');
+*/
+
+define(RECEIPT_THANK_YOU,1);
+define(RECEIPT_RECEIPT,2);
+define(RECEIPT_INVOICE,3);
+define(RECEIPT_HONOR_OF,4);
+define(RECEIPT_HONOR_OF_NO_AMOUNT,5);
+
+define(RECEIPT_PATH,'receipt');
+
+
+define(RESULTS_PER_PAGE,50);
+
+
+if (!function_exists('civiutils_include')) {
+  function civiutils_include($filelist=null) {
+    if (!module_exists('civicrm')) {
+      return FALSE;
+    }
+    civicrm_initialize(TRUE);
+    foreach($filelist as $file) {
+      if (in_array($file,array('Config','DAO'))) {
+        require_once "CRM/Core/$file.php";
+      }
+      else {
+        require_once 'api/v2/' . $file . '.php';
+      }
+    }
+    return true;
+  }
+}
+
+/**
+ * Implementation of hookenable().
+ */
+function civireceipts_enable() {
+  if (!is_dir(_civireceipts_get_path())) {
+    if (!mkdir(_civireceipts_get_path())) {
+      drupal_set_message('Could not make path for receipts images.','warning');
+    }
+  }
+}
+
+function _civireceipts_get_path($full = 0) {
+  $p = file_directory_path() . '/' . RECEIPT_PATH;
+  if ($full) {
+    $p = getcwd() . '/' . $p;
+  }
+  return $p;
+}
+
+/**
+ * Implementation of hook_perm().
+ */
+function civireceipts_perm() {
+  return array('send receipts');
+}
+  
+  
+/**
+ * Implementation of hook_menu().
+ */
+function civireceipts_menu() {
+  $items = array();
+    $items['civireceipt'] = array(
+      'title' => t('PDF Receipts'),
+      'page callback' => 'civireceipts_node_controller',
+      'access arguments' => array('access content'),
+      'type' => MENU_CALLBACK
+    );
+    $items['admin/civireceipts'] = array(
+      'title' => t('PDF Receipts Emailer'),
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('civireceipts_receipt_list'),
+      'access arguments' => array('send receipts'),
+      'type' => MENU_CALLBACK
+    );
+    $items['admin/settings/civireceipts'] = array(
+      'title' => t('CiviReceipts Settings'),
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('civireceipts_settings'),
+      'access arguments' => array('send receipts'),
+    //  'type' => MENU_CALLBACK
+    );
+    $items['tmpTESTER'] = array(
+      'title' => t('PDF Receipts Emailer'),
+      'page callback' => 'civireceipts_emailer',
+      'access arguments' => array('send receipts'),
+      'type' => MENU_CALLBACK
+    );
+    
+  return $items;
+}
+
+/**
+ *  Admin Settings form.
+ */
+function civireceipts_settings($form_values = NULL) {
+  // Add this line to allow for file upload
+  $form['#attributes'] = array('enctype' => 'multipart/form-data');
+  $form['civireceipts'] = array(
+    '#type' => 'fieldset',
+    '#title' => 'Settings'
+  );
+  $form['civireceipts']['civireceipts_from_address'] = array(
+    '#type' => 'textfield',
+    '#default_value' => variable_get('civireceipts_from_address',''),
+    '#title' => 'From Address',
+  );
+  $form['civireceipts']['civireceipts_cc_address'] = array(
+    '#type' => 'textfield',
+    '#default_value' => variable_get('civireceipts_cc_address',''),
+    '#title' => 'CC Address',
+  );
+  $form['civireceipts']['civireceipts_subject'] = array(
+    '#type' => 'textfield',
+    '#default_value' => variable_get('civireceipts_subject','Official Receipt'),
+    '#title' => 'Email Subject',
+  );
+  $contribution_pages = civireceipts_get_contribution_pages();
+  $form['civireceipts']['civireceipts_contribution_pages'] = array(
+    '#type' => 'select',
+    '#multiple' => TRUE,
+    '#options' => $contribution_pages,
+    '#default_value' => variable_get('civireceipts_contribution_pages',''),
+    '#title' => 'Contribution Pages to NOT send Receipts for',
+  );
+  $form['civireceipts']['civireceipts_receipt_template_pdf'] = array(
+    '#type' => 'file',
+    '#title' => 'Template file for PDF receipts ('.variable_get('civireceipts_receipt_template_pdf_filename', 'none selected').')',
+  );
+  $form['civireceipts']['letters'] = array(
+    '#type' => 'fieldset',
+    '#title' => 'Texts for Letters',
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  );
+  $receipt_emails_types = civireceipts_get_receipt_emails_types();
+  foreach($receipt_emails_types as $id => $name) {
+    $form['civireceipts']['letters']["civireceipts_letter_text_$id"] = array(
+      '#type' => 'textarea',
+      '#default_value' => variable_get("civireceipts_letter_text_$id",''),
+      '#title' => "Text for '$name' letter",
+    );
+  }
+  $form['civireceipts']["civireceipts_ticket_not_found"] = array(
+    '#type' => 'textarea',
+    '#default_value' => variable_get("civireceipts_ticket_not_found",'Ticket not found. Please contact us for assistance.'),
+    '#title' => '"Ticket not found" message',
+  );
+  $form['#submit'][] = 'civireceipts_settings_submit';
+  return system_settings_form($form);
+}
+
+function civireceipts_settings_submit($form, &$form_state) {
+  if ($file = file_save_upload('civireceipts_receipt_template_pdf')) {
+     file_copy($file , _civireceipts_get_path() . "/$file->filename");
+     variable_set('civireceipts_receipt_template_pdf_filename', $file->filename);
+  }
+}
+
+function civireceipts_get_contribution_pages() {
+  return civireceipts_get_types('civicrm_contribution_page','title');
+}
+function civireceipts_get_receipt_emails_types() {
+  return civireceipts_get_types('civicrm_receipt_emails_types');
+}
+function civireceipts_get_contrib_types() {
+  return civireceipts_get_types('civicrm_contribution_type');
+}
+function civireceipts_get_types($table,$field = 'name') {
+  if (!civiutils_include(array('DAO'))) {
+    return FALSE;
+  }
+  $dao =& CRM_Core_DAO::executeQuery("SELECT `id`,`$field` FROM $table");
+  $types = array();
+  while ($dao->fetch())  {
+    $types[$dao->id] = $dao->$field;
+  }
+  return $types;
+}
+function civireceipts_get_contrib_status_types() {
+  if (!civiutils_include(array('DAO'))) {
+    return FALSE;
+  }
+  $sql = 'select label,value from civicrm_option_value where is_active=1 and civicrm_option_value.option_group_id=11';
+  $dao =& CRM_Core_DAO::executeQuery($sql);
+  $contrib_status_types = array();
+  while ($dao->fetch())  {
+    $contrib_status_types[$dao->value] = $dao->label;
+  }
+  return $contrib_status_types;
+}
+function civireceipts_receipt_list_submit($form, &$form_state) {
+  if (!civiutils_include(array('DAO','Contact','Contribute'))) {
+    return FALSE;
+  }
+  drupal_add_js(drupal_get_path('module', 'civireceipts'). '/civireceipts.js');
+  $form_values = $form_state['values'];
+
+  $begin_date = $form_values['begin_date']['year'].'-'.
+  $form_values['begin_date']['month'].'-'.
+  $form_values['begin_date']['day'].' 00:00:00';
+  $end_date = $form_values['end_date']['year'].'-'.
+  $form_values['end_date']['month'].'-'.
+  $form_values['end_date']['day'].' 23:59:59';
+  
+  $year = $form_values['year'];
+  
+  civireceipts_save_letter_types($form_values);
+  if ('Send Emails' == $form_values['op']) {
+    civireceipts_send_emails($form_values);
+  }
+  if ('Print PDFs' == $form_values['op']) {
+    civireceipts_print_pdfs($form_values);
+  }
+  if ('Print PDFs With NO Background' == $form_values['op']) {
+    civireceipts_print_pdfs($form_values,1);
+  }
+  $contrib_where = '';
+  $receipt_emails_types = civireceipts_get_receipt_emails_types();
+  if (0 < count($form_values['contrib_types'])) {
+    $contrib_where = 'AND (0';
+    foreach($form_values['contrib_types'] as $ctype) {
+      $contrib_where .= ' OR contribution_type_id = '.$ctype;
+    }
+    $contrib_where .= ')';
+  }
+  $pdfviewed_where = '';
+  if (1 === $form_values['pdfviewed']) {
+    $pdfviewed_where = ' AND `viewed` IS NOT NULL';
+  }
+  if (0 === $form_values['pdfviewed']) {
+    $pdfviewed_where = ' AND `viewed` IS NULL';
+  }
+  if (0 == $form_values['page']) {
+    $form_values['page'] = 1;
+  }
+  /*
+  if (0 < count($form_values['sendlettertype'])) {
+    $sendlettertype_where = 'AND (0';
+    foreach($form_values['sendlettertype'] as $ltype) {
+      $sendlettertype_where .= ' OR cvds.send_letter_231 = '.$ltype;
+    }
+    $sendlettertype_where .= ')';
+  }
+  */
+  $sql = "FROM civicrm_contribution
+       #   LEFT JOIN civicrm_value_1_donation_selection_19 cvds ON civicrm_contribution.id = cvds.entity_id
+          WHERE receive_date BETWEEN '$year-01-01' 
+            AND '$year-12-31' $contrib_where $pdfviewed_where $sendlettertype_where
+          ORDER BY receive_date DESC";
+/*
+          
+          remove paging stuff
+  $dao =& CRM_Core_DAO::executeQuery('SELECT COUNT(*) AS c ' . $sql);
+  $dao->fetch();
+  $count = $dao->c;
+  */
+  $viewed_texts = civireceipts_get_receipt_emails_types();
+  foreach($viewed_texts as $k => $text) {
+    $viewed_sql .= "
+        ,(SELECT viewed FROM civicrm_receipt_emails
+          WHERE contribution_id=civicrm_contribution.id 
+                AND civicrm_receipt_emails_type=$k) as '$text'";
+  }
+  $sql = "SELECT * , civicrm_contribution.id as ccid  
+          $viewed_sql $sql 
+          LIMIT " . (RESULTS_PER_PAGE * ($form_values['page']-1)) ."," . RESULTS_PER_PAGE;
+  $rows = array();
+  $contrib_status_types = civireceipts_get_contrib_status_types();
+  $contrib_types = civireceipts_get_contrib_types();
+//  echo $sql;
+  $sql = "SELECT *  , SUM(total_amount) AS total, civicrm_contribution.id as ccid   
+          FROM civicrm_contribution
+          WHERE receive_date BETWEEN '$year-01-01' 
+            AND '$year-12-31' $contrib_where $pdfviewed_where $sendlettertype_where
+          GROUP BY contact_id";
+  $dao =& CRM_Core_DAO::executeQuery($sql);
+
+
+  if ('Print All Receipts' == $form_values['op']) {
+    $contributions = array();
+    while ($contribution = $dao->fetch()) {
+      $contributions[] = array($dao->ccid, RECEIPT_RECEIPT);
+    }
+    if ($contributions) {
+      _civireceipts_generate_pdfs($contributions);
+    }
+  }
+
+  while ($dao->fetch()) {
+    $types_select = "<option value=\"0\">- none -</option>";
+    foreach ($receipt_emails_types as $id => $name) {
+      $types_select .= "<option value=\"{$id}\" $sel>{$name}</option>";
+    }
+    $params = array  (
+      'id' => $dao->contact_id,
+    );
+    $contact = & civicrm_contact_search($params);
+    $contact = array_pop($contact);
+    if ('' != $dao->honor_contact_id) {
+      $params = array  (
+        'id' => $dao->honor_contact_id,
+      );
+      $honoree = & civicrm_contact_search($params);
+      $honoree = array_pop($honoree);
+    }
+    else {
+      $honoree = array();
+    }
+    $thankyou = '';
+    $viewed = '';
+    foreach($viewed_texts as $text) {
+      $tmp = str_replace(' ','_',$text);
+      if ('' != $dao->$tmp && '0000-00-00 00:00:00' != $dao->$tmp) {
+        $viewed .= "$text, ";
+      }
+      if ('' != $dao->$tmp) {
+        $thankyou .= "$text, ";
+      }
+    }
+    $viewed = ('' == $viewed) ? 'none' : substr($viewed,0,strlen($viewed)-2);
+    $thankyou = ('' == $thankyou) ? 'none' : substr($thankyou,0,strlen($thankyou)-2);
+    $status = $contrib_status_types[$dao->contribution_status_id];
+    $type = $contrib_types[$dao->contribution_type_id];
+    $rows[] = array(
+      $contact['contact_id'],
+      '<a href="/civicrm/contact/view?reset=1&cid='.$contact['contact_id'].'">'.$contact['display_name'].'</a>
+      <a href="mailto:' . $contact['email'] . '">' . $contact['email'] . '</a>',
+      '$'.$dao->total,
+      $thankyou,
+      $viewed,
+      '<select name="sendemailto_contribution_id_' . $dao->ccid . '">' .
+        $types_select . 
+      '</select>',
+    );
+  }
+  $form_state['begin_date'] = $form_values['begin_date'];
+  $form_state['end_date'] = $form_values['end_date'];
+  $form_state['year'] = $form_values['year'];
+  $form_state['stored_values']['rows'] = $rows;
+  $form_state['stored_values']['count'] = $count;
+  $form_state['stored_values']['page_header'] = "<h2>Received between '1/1/$year' AND '12/31/$year':</h2>";
+  $form_state['rebuild'] = true;
+}
+/**
+ * Menu callback
+ */
+function civireceipts_receipt_list($form_values = NULL) {
+  // These next three lines make the pager work. Don't know how else to do it
+  if (0 != $_GET['page'] && 0 == count($_POST)) {
+    $form_values['values'] = $_GET;
+    civireceipts_receipt_list_submit($form, $form_values);
+  }
+  if (!civiutils_include(array('DAO'))) {
+    return FALSE;
+  }
+  $form = array();
+  $form['#redirect'] = FALSE;
+  $form['searchparams'] = array(
+    '#type' => 'fieldset',
+    '#title' => 'Search Parameters',
+  );
+  /*
+  $form['searchparams']['begin_date'] = array(
+    '#type' => 'date',
+    '#title' => 'Begin Date',
+    '#default_value' => $form_values['begin_date']
+  );
+  $form['searchparams']['end_date'] = array(
+    '#type' => 'date',
+    '#title' => 'End Date',
+    '#default_value' => $form_values['end_date']
+  );
+  $form['searchparams']['contrib_types'] = array(
+    '#type' => 'select',
+    '#options' => civireceipts_get_contrib_types(),
+    '#title' => 'Contribution Type',
+    '#default_value' => $form_values['contrib_types'],
+    '#multiple' => TRUE,
+  );
+  */
+  $form['searchparams']['year'] = array(
+    '#type' => 'select',
+    '#title' => t('Year'),
+    '#options' => drupal_map_assoc(range(2000,2020)),
+    '#default_value' => $form_values['year'],
+  );
+  $form['searchparams']['pdfviewed'] = array(
+    '#type' => 'radios',
+    '#title' => t('PDF Receipt has been viewed?'),
+    '#options' => array('1' => 'Yes', '0' => 'No', '-1' => 'Either'),
+    '#default_value' => $form_values['pdfviewed']
+  );
+  /*
+  $form['searchparams']['sendlettertype'] = array(
+    '#type' => 'select',
+    '#title' => t('Letter Type'),
+    '#options' => civireceipts_get_receipt_emails_types(),
+    '#default_value' => $form_values['sendlettertype'],
+    '#multiple' => TRUE,
+  );
+*/
+  $form['searchparams'][] = array(
+    '#type' => 'submit',
+    '#value' => 'Search'
+  );
+  if (0 < $form_values['stored_values']['rows']) {
+    $headers = array(
+      'ID',
+      'Donor',
+      'Total Amount',
+      'Clicked on link',
+      'Letters Sent',
+      'Send Letter',
+    );
+    $form['table'] = array(
+      '#prefix' => $form_values['stored_values']['page_header'],
+      '#value' => theme('table',$headers,$form_values['stored_values']['rows'] )
+    );
+    $GLOBALS['pager_page_array'][] = $form_values['page'];
+    $GLOBALS['pager_total'][] = ceil($form_values['stored_values']['count']/RESULTS_PER_PAGE);
+    $form[] = array (
+      '#value' => theme('pager')
+    );
+    $form[] = array(
+      '#type' => 'submit',
+      '#value' => 'Send Emails'
+    );
+    $form[] = array(
+      '#type' => 'submit',
+      '#value' => 'Print PDFs'
+    );
+    $form[] = array(
+      '#type' => 'submit',
+      '#value' => 'Print All Receipts'
+    );
+/*
+$form[] = array(
+      '#type' => 'submit',
+      '#value' => 'Print PDFs With NO Background',
+    );
+    $form[] = array(
+      '#type' => 'submit',
+      '#value' => 'Save Letter Types',
+    );
+*/ 
+  }
+
+//  $form['xx'] = array(
+//    '#prefix' => $page_header,
+//    '#value' =>'<label for="SendFreshEmailBox">Check all</label><input type="checkbox" id="SendFreshEmailBox" name="SendFreshEmailBox" />'
+//  );
+   
+  return $form;
+}
+function civireceipts_save_letter_types($form) {
+  return; ///////// This feature not used for
+  civiutils_include(array('DAO'));
+  foreach($_POST as $k => $v) {
+    $sp = split('_id_',$k);
+    if ('sendemailto_contribution' == $sp[0] && 0 != $v) {
+      $sql = "UPDATE `civicrm_value_1_donation_selection_19` 
+              SET `send_letter_231`='$v'
+              WHERE `entity_id`='{$sp[1]}';";
+      $dao =& CRM_Core_DAO::executeQuery($sql);
+    }
+  }
+  drupal_set_message('Letter types were saved.');
+}
+
+function civireceipts_send_emails($form) {
+  foreach($_POST as $k => $v) {
+    $sp = split('_id_',$k);
+    if ('sendemailto_contribution' == $sp[0] && 0 != $v) {
+      civireceipts_emailer($sp[1],$v);
+    }
+  }
+  drupal_set_message('Emails were sent.');
+}
+function civireceipts_print_pdfs($form) {
+  $concons = array();
+  foreach($_POST as $k => $v) {
+    $sp = split('_id_',$k);
+    if ('sendemailto_contribution' == $sp[0] && 0 != $v) {
+      $concons[] = array($sp[1],$v);
+    }
+  }
+  _civireceipts_generate_pdfs($concons);
+}
+function _civireceipts_generate_pdfs($contributions) {
+  $pdf = civireceipts_make_ticket($contributions);
+
+  $filename = 'RANdonations';
+  $filename = strtr(strip_tags($filename), " .,?!&#", "_______").'.pdf';
+  print $pdf->Output($filename, 'I');
+  module_invoke_all('exit');
+  $pdf->Close();
+}
+
+/*
+function civireceipts_get_contact($contribution_id,$type_id) {
+  if (!civiutils_include(array('Contact'))) {
+    return FALSE;
+  }
+  $sql = "SELECT * FROM `civicrm_contribution` WHERE id = '$contribution_id';";
+  $dao =& CRM_Core_DAO::executeQuery($sql);
+  $dao->fetch();
+  if (RECEIPT_HONOR_OF_NO_AMOUNT == $type_id || RECEIPT_HONOR_OF == $type_id) {
+    $id = $dao->honor_contact_id;
+  }
+  else {
+    $id = $dao->contact_id;
+  }
+  $params = array  (
+    'id' => $id
+  );
+  $contact = & civicrm_contact_search($params);
+  return array_pop($contact);
+}
+ */
+
+function civireceipts_get_contact($contribution_id,$type_id) {
+  if (!civiutils_include(array('Contact'))) {
+    return FALSE;
+  }
+  $sql = "SELECT * FROM `civicrm_contribution` WHERE id = '$contribution_id';";
+  $dao =& CRM_Core_DAO::executeQuery($sql);
+  $dao->fetch();
+  $id = $dao->contact_id;
+  $sql = "SELECT * FROM `civicrm_contact` WHERE id = '".$id."';";
+  $contact =& CRM_Core_DAO::executeQuery($sql);
+  $contact->fetch();
+  if (!empty($contact->postal_greeting_display)) {
+    $dear_name = $contact->postal_greeting_display;
+  } elseif (!empty($contact->first_name)) {
+    $dear_name = 'Dear ' . $contact->first_name;
+  } else {
+    $dear_name = 'Dear ' . $contact->display_name;
+  }
+  $params = array  (
+    'id' => $id,
+  );
+  $contact = & civicrm_contact_search($params);
+  $contact = array_pop($contact);
+  $contact['dear_name'] = $dear_name;
+
+  $contact['household'] = $contact['display_name'];
+  $spouse = _civireceipts_get_spouse($id);
+  if ($spouse) {
+    if ($spouse['last_name'] == $contact['last_name']) {
+      $contact['household'] = $contact['first_name'] . ' and ' . $spouse['first_name'] . ' ' .$contact['last_name'];
+    } else {
+      $contact['household'] = $contact['display_name'] . ' and ' . $spouse['display_name'];
+    }
+  }
+  return $contact;
+}
+
+
+/**
+ * Find spouse of a contact.
+ *
+ * @param $contactId
+ * @return Array or false
+ */
+function _civireceipts_get_spouse($contactId) {
+  if (!civiutils_include(array('DAO', 'Contact'))) {
+    return FALSE;
+  }
+  $dao =& CRM_Core_DAO::executeQuery(sprintf(
+    'select contact_id_a, contact_id_b from civicrm_relationship where contact_id_a = "%d" or contact_id_b = "%d" and relationship_type_id = 2',
+    $contactId, $contactId
+  ));
+  if (!$dao->fetch()) {
+    return false;
+  }
+  $spouseContactId = $dao->contact_id_a == $contactId ? $dao->contact_id_b : $dao->contact_id_a;
+  if ($spouseContactId) {
+    $params = array  (
+      'id' => $spouseContactId,
+    );
+    $spouse = & civicrm_contact_search($params);
+    $spouse = array_pop($spouse);
+  }
+  return false;
+}
+
+
+function civireceipts_emailer($contribution_id,$type_id) {
+  if (!civiutils_include(array('Contribute','Contact','DAO'))) {
+    return FALSE;
+  }
+  $contact = civireceipts_get_contact($contribution_id,$type_id);
+  $headers['MIME-Version'] = '1.0';
+  $headers['Content-Type'] = 'text/html; charset=utf-8';
+  $vars = array(
+    'from' => xxxx,
+    'display_name' => $contact['display_name'],
+    'header_image' => _civireceipts_get_path() . '/' . variable_get('arms_email_header_image_filename',''),
+    'receipt_url' => url('civireceipt/'.$contact['contact_id'].'/'.$contribution_id.'/'.$type_id,
+                        array('absolute' => TRUE)),
+    'type_id' => $type_id,
+  );
+  $body = civireceipts_email_theme($vars);
+  $recipient = $contact['email'];
+  $from = variable_get('civireceipts_from_address','');
+  $params = array('headers' => $headers, 'body' => $body, 'from' => $from);
+  drupal_mail('civireceipts', 'civireceipts', $recipient, 'English', $params );
+  $sql = "SELECT * FROM `civicrm_receipt_emails` WHERE `contribution_id`= '$contribution_id' AND `civicrm_receipt_emails_type`=$type_id;";
+  $dao =& CRM_Core_DAO::executeQuery($sql);
+  if (!$dao->fetch()) {
+    $sql = "insert into `civicrm_receipt_emails`(`viewed`,`contribution_id`,`civicrm_receipt_emails_type`) values (0000, '$contribution_id',$type_id);";
+    $dao =& CRM_Core_DAO::executeQuery($sql);
+  }
+}
+
+function civireceipts_mail($key, &$message, $params) {
+  switch($key) {
+    case 'civireceipts':
+      $message['subject'] = variable_get('civireceipts_subject','Official Receipt');
+      $message['body'] = $params['body'];
+      $message['headers'] = $params['headers'];
+      $message['headers']['cc'] = variable_get('civireceipts_cc_address','');
+      $message['headers']['from'] = variable_get('civireceipts_from_address','');
+      $message['headers']['Reply-To'] = $params['from'];
+      break;
+  }
+}
+function civireceipts_civicrm_post( $op, $objectName, $objectId, &$objectRef ) {
+  if ('create' == $op && 'Participation' == $objectName) {
+    global $user;if ($user->uid == 1) {
+       print_r(1 == $$objectRef );
+     die;
+    }
+  }
+  if ('create' == $op && 'Contribution' == $objectName &&
+    // Add these two checks which means "either it's not a contribution being inputted
+    //  by staff OR (if it is such) then the email receipt checkbox IS checked.
+    ('Contribution:upload' != $_POST['_qf_default'] || 1 == $_POST['is_email_receipt'])) {
+    // Here are magic numbers which are just records in the civicrm_contribution_type table
+    // the first one is a page that the asked to hard code NOT to send receipts.
+    if (8 != $objectRef->contribution_page_id &&
+      (1 == $objectRef->contribution_type_id || 3 == $objectRef->contribution_type_id)) {
+      $contact_id = $objectRef->contact_id;
+      $contribution_id = $objectRef->id;
+      //print_r($objectRef);die;
+      civireceipts_emailer($contribution_id,2);
+    }
+  }
+}
+/**
+ * Menu callback
+ */
+function civireceipts_node_controller($contact_id,$contribution_id,$type_id) {
+  if (!civiutils_include(array('DAO')) || !is_numeric($contact_id) || !is_numeric($contribution_id)) {
+    return variable_get("civireceipts_ticket_not_found", 'Ticket not found. Please contact us for assistance.');
+  }
+  if (RECEIPT_HONOR_OF_NO_AMOUNT == $type_id || RECEIPT_HONOR_OF == $type_id) {
+    $sql = "select * from civicrm_contribution where honor_contact_id= $contact_id and id=$contribution_id";
+  }
+  else {
+    $sql = "select * from civicrm_contribution where contact_id= $contact_id and id=$contribution_id";
+  }
+  $dao =& CRM_Core_DAO::executeQuery($sql);
+  if (!($dao->fetch())) {
+    return variable_get("civireceipts_ticket_not_found", 'Ticket not found. Please contact us for assistance.');
+  }
+  $pdf = civireceipts_make_ticket(array(array($contribution_id,$type_id)));
+  if (false == $pdf) {
+    return variable_get("civireceipts_ticket_not_found", 'Ticket not found. Please contact us for assistance.');
+  }
+  $sql = "update `civicrm_receipt_emails` set `viewed`=NOW() where `contribution_id`='$contribution_id' AND `civicrm_receipt_emails_type`=$type_id";
+  $dao =& CRM_Core_DAO::executeQuery($sql);
+  module_invoke('tcpdf','generate_file',$pdf,"Receipt_$contact_id_$contribution_id_$type_id");
+}
+
+/**
+ * Makes the tickets content
+ */
+function civireceipts_make_ticket($conconvalues) {
+  civiutils_include(array('Contribute'));
+  $pdf = theme('civireceipts_pdf');
+  $pdf->SetFont(PDF_FONT_NAME_MAIN, '', PDF_FONT_SIZE_MAIN);
+  foreach($conconvalues as $concon) {
+    list($thecontrib,$type_id) = $concon;
+    $pdf->AddPage();
+    $thecontact = civireceipts_get_contact($thecontrib,$type_id);
+    $params = array  (
+      'contribution_id' => $thecontrib,
+    );
+    $thecontrib = &civicrm_contribution_get($params);
+    civireceipts_make_ticket_body($pdf,$thecontact,$thecontrib,$type_id);
+  }
+  return $pdf;
+}
+
+
+function _civireceipts_pdf_debug_grid(&$pdf) {
+  $pdf->SetLineStyle(array(
+    'width' => 0.25,
+    'color' => array(230, 230, 230),
+  ));
+  $maxX = 210;
+  $maxY = 280;
+  function linestyle($x) {
+    $width = 0.25;
+    if ($x % 20 == 0) {
+      $color = array(175, 175, 175);
+    } elseif ($x % 5 == 0) {
+      $color = array(200, 200, 200);
+    } else {
+      $width = 0.1;
+      $color = array(230, 230, 230);
+    }
+    return compact('width', 'color');
+  }
+  for ($x = 0 ; $x <= $maxX; $x++) {
+    $pdf->SetLineStyle(linestyle($x));
+    $pdf->Line($x, 0, $x, $maxY);
+  }
+  for ($y = 0 ; $y <= $maxY; $y++) {
+    $pdf->SetLineStyle(linestyle($y));
+    $pdf->Line(0, $y, $maxX, $y);
+  }
+  $pdf->SetColorArray('text', array(255, 0, 0));
+}
+
+function civireceipts_make_ticket_body(&$pdf,$thecontact,$thecontrib,$type_id) {
+
+  if (!civiutils_include(array('DAO'))) {
+    return FALSE;
+  }
+  $sql = "SELECT organization_name FROM civicrm_contact WHERE id = 
+    (SELECT employer_id FROM civicrm_contact WHERE id={$thecontact['contact_id']})";
+  $dao =& CRM_Core_DAO::executeQuery($sql);
+  $dao->fetch();
+
+  $paydate = date("F j, Y",strtotime($thecontrib['receive_date']));
+  $todaydate = date("F j, Y");
+  $letter_content = _civireceipts_get_letter_content($type_id);
+  $letter_content = str_replace('%XX%',$thecontrib['household'],$letter_content);
+  $addr = ('' == $thecontact['street_address']) ? '' : $thecontact['street_address'] . "\n";
+  $addr .= ('' == $thecontact['supplemental_address_1']) ? '' : $thecontact['supplemental_address_1'] . "\n";
+  $name = $thecontact['household'];
+  $name .= ('' == $dao->organization_name) ? '' : "\n" . $dao->organization_name;
+  $name_and_address = $name . "\n" . $addr;
+  if (!empty($thecontact['supplemental_address_1'])) {
+    $name_and_address .= $thecontact['supplemental_address_1']."\n";
+  }
+  if ($thecontact['city']) {
+    $name_and_address .= "{$thecontact['city']}, ";
+  }
+  if ($thecontact['state_province_name']) {
+    $name_and_address .= "{$thecontact['state_province_name']} ";
+  }
+  if ($thecontact['postal_code']) {
+    $name_and_address .= $thecontact['postal_code'];
+  }
+  $tax_year = 'December 31, '.date('Y', strtotime($thecontrib['receive_date']));
+
+  if ($type_id == RECEIPT_RECEIPT) {
+    $pdfTemplateFile = _civireceipts_get_path() . '/' . variable_get('civireceipts_receipt_template_pdf_filename', '');
+    $pages = $pdf->setSourceFile($pdfTemplateFile);
+    if ($pages == 0) {
+      throw new Exception('Unable to load receipt template.');
+    }
+    $template = $pdf->importPage(1);
+    if ($template === false) {
+      throw new Exception('Unable to read page from receipt template.');
+    }
+    $pdf->useTemplate($template, 0, 0, 0, 0, true);
+
+    $layout = theme('civireceipts_pdf_layout_'.$type_id);
+    if (!empty($layout['debug'])) {
+      _civireceipts_pdf_debug_grid($pdf);
+    }
+    unset($layout['debug']);
+
+// This is wrong:
+//    $thecontrib['total_amount'] = '$'.number_format(round($thecontrib['total_amount'], 2), 2);
+// Replace with:
+    $sql = "SELECT *  , SUM(total_amount) AS total, civicrm_contribution.id as ccid   
+          FROM civicrm_contribution
+          WHERE receive_date BETWEEN '" . date('Y', strtotime($thecontrib['receive_date'])) . "-01-01' 
+            AND '" . date('Y', strtotime($thecontrib['receive_date'])) . "-12-31'
+          AND contact_id = {$thecontact['contact_id']}";
+    $dao =& CRM_Core_DAO::executeQuery($sql);
+    $dao->fetch();
+    $thecontrib['total_amount'] = '$'.number_format(round($dao->total, 2), 2);
+
+
+
+    $thecontact['dear_name'] .= ',';
+    $data = array_merge($thecontrib, $thecontact);
+    $data['receipt_number'] = sprintf(
+      '%d-%06d',
+      date('Y', strtotime($thecontrib['receive_date'])),
+      $thecontrib['contribution_id']
+    );
+    $data = array_merge($data, compact('name', 'addr', 'name_and_address', 'tax_year'));
+    foreach ($data as $field => $value) {
+      $letter_content = str_replace('%'.$field.'%', $value, $letter_content);
+    }
+    $data['letter_content'] = $letter_content;
+
+
+    $pdf->SetFont('times');
+    $pdf->SetAutoPageBreak(false);
+
+
+    foreach ((array) $layout as $cell) {
+      $pdf->SetFont('times', '', 12);
+      if (!empty($cell['font'])) {
+        $pdf->SetFont($cell['font']);
+      }
+      if (!empty($cell['style'])) {
+        $pdf->SetFont('', $cell['style']);
+      }
+      if (!empty($cell['size'])) {
+        $pdf->SetFontSize($cell['size']);
+      }
+      $pdf->setXY($cell['x'], $cell['y']);
+      $border = 0;
+      $pdf->MultiCell(0, 0, $data[$cell['field']], $border, 'L');
+    }
+  } else {
+
+    $txt = <<<STOP
+
+$todaydate
+
+{$name}
+{$addr}{$thecontact['city']}, {$thecontact['state_province_name']} {$thecontact['postal_code']}
+
+Dear {$thecontact['display_name']},
+STOP;
+    $pdf->Ln(25);
+    //  $pdf->SetMargins(20,20);
+    $pdf->SetFont('dejavusans','',10);
+    $pdf->write(1,$txt);
+    $pdf->Ln(8);
+    $pdf->MultiCell(180,110,$letter_content,0,1,'L');
+    $pdf->SetFont('dejavusans','',8);
+    $pdf->Ln(18);
+    if (0 == $no_images && $t = variable_get('civireceipts_official_receipt_filename','')) {
+      $pdf->Image(_civireceipts_get_path(1) . '/' . $t,40,205,30,12);
+    }
+    else {
+      $pdf->Image(_civireceipts_get_path(1) . '/BLANKofficialreceipt.jpg',0,205,50,7);
+    }
+    $pdf->Ln(8);
+    $pdf->Cell(30,4,"Received From:",0,0,'L');
+    $pdf->Cell(70,4,$thecontact['display_name'],0,0,'L');
+    $pdf->Cell(30,4,'Receipt Number:',0,0,'L');
+    $pdf->Cell(30,4,$thecontact['id'],0,0,'L');
+
+    $pdf->Cell(30,4,"",0,0,'L');
+    $pdf->Cell(70,4,'sss',0,0,'L');
+    $pdf->Cell(30,4,'Amount:',0,0,'L');
+    $pdf->Cell(30,4,$thecontrib['total_amount'],0,0,'L');
+
+    $pdf->Cell( 20,4,"Date:",0,0,'L');
+    $pdf->Cell( 20,4,$paydate,0,1,'L');
+    $pdf->Cell(100,4,$thecontact['street_address'],0,1,'L');
+    if ('' == $thecontact['supplemental_address_1']) {
+      $citystate = '';
+      $supplemental_address_1 = "{$thecontact['city']}, {$thecontact['state_province_name']} {$thecontact['postal_code']}";
+    } else {
+      $citystate = "{$thecontact['city']}, {$thecontact['state_province_name']} {$thecontact['postal_code']}";
+      $supplemental_address_1 = $thecontact['supplemental_address_1'];
+    }
+    $pdf->Cell( 20,4,"Amount:",0,0,'L');
+    $pdf->Cell( 20,4,$thecontrib['total_amount'],0,1,'L');
+    $pdf->Cell(100,4,$supplemental_address_1,0,0,'L');
+    $pdf->Cell( 20,4,"Description:",0,0,'L');
+    $pdf->Cell( 20,4,$thecontrib['contribution_source'],0,1,'L');
+    $pdf->Cell(100,4,$citystate,0,0,'L');
+    //  $pdf->Cell(100,4,'',0,0,'L');
+    $pdf->Cell(20,4,"Trans. ID:",0,0,'L');
+    $pdf->Cell(20,4,$thecontrib['trxn_id'],0,1,'L');
+    $pdf->Cell(120,8,"----",0,1,'C');
+  }
+
+  return $pdf;
+}
+
+function _civireceipts_get_letter_content($type_id) {
+  return variable_get("civireceipts_letter_text_$type_id",'');
+}
+
+/**
+ * Implementation of hook_theme().
+ */
+function civireceipts_theme($existing, $type, $theme, $path) {
+  return array(
+    'civireceipts_pdf' => array(
+      'arguments' => array(),
+    ),
+    // Layout for Receipts (type_id == 2) 
+    'civireceipts_pdf_layout_2' => array(
+      'arguments' => array(),
+    ),
+  );
+}
+
+
+/**
+ * Open a new PDF document and set its properties
+ * @ingroup themeable
+ */
+function theme_civireceipts_pdf() {
+  $path = libraries_get_path('tcpdf');
+  require_once("$path/config/tcpdf_config.php");
+  require_once("$path/tcpdf.php");
+  $path = libraries_get_path('fpdi');
+  require_once("$path/fpdi.php");
+
+  $pdf = module_invoke('tcpdf','create_pdf','civireceipts', 'mypdf.php');
+
+  $module_path = drupal_get_path('module', 'civireceipts');
+  require_once($module_path . '/mypdf.php');
+  $pdf = new MYPDF(PDF_PAGE_ORIENTATION, PDF_UNIT, 'LETTER', TRUE);
+  $pdf->Open();
+
+
+  // set margins
+  $pdf->SetMargins(PDF_MARGIN_LEFT, PDF_MARGIN_TOP, PDF_MARGIN_RIGHT);
+  $pdf->SetHeaderMargin(PDF_MARGIN_HEADER);
+  $pdf->SetFooterMargin(PDF_MARGIN_FOOTER);
+  $pdf->setPrintFooter(true);
+
+  // set auto page breaks  
+  $pdf->SetAutoPageBreak(TRUE, PDF_MARGIN_BOTTOM);
+  
+  // set image scale factor
+  $pdf->setImageScale(PDF_IMAGE_SCALE_RATIO);
+  
+  $pdf->setHeaderFont(Array(PDF_FONT_NAME_MAIN, '', PDF_FONT_SIZE_MAIN));
+  $pdf->setFooterFont(Array(PDF_FONT_NAME_DATA, '', PDF_FONT_SIZE_DATA));
+  
+  return $pdf;
+}
+
+/**
+ * Layout PDF elements for RECEIPTS (2)
+ *
+ * @ingroup themeable
+ * @return array
+ */
+function theme_civireceipts_pdf_layout_2() {
+  return array(
+    'debug' => true,
+    array(
+      // x position (required)
+      'x' => 170,
+      // y position (required)
+      'y' => 50.5,
+      // field name to display (required)
+      'field' => 'total_amount',
+      // style of font (optional)
+      'style' => 'B',
+      // size of font (optional)
+      'size' => 13,
+    ),
+  );
+}
+
+
+function civireceipts_email_theme($vars) {
+  if (RECEIPT_HONOR_OF_NO_AMOUNT == $vars['type_id'] || RECEIPT_HONOR_OF == $vars['type_id']) {
+    $letter = '<p>You have been honored in a donation</b>.
+          <br><br> Please visit this link for a printable PDF "In Honor Of" letter:</p>';
+  } else {
+    $letter = "<p>Thank you for your donation</b>.
+          <br><br> Please visit this link for a printable PDF receipt:</p>";
+  }
+  $style = "<style>
+      <!--
+        html, body {margin:0; padding:0; background-color:#fff;}
+        #container {margin:0 auto; width:670px; font:normal 10pt arial,helvetica,sans-serif;}
+        #header {width:670px; margin:0; text-align:center;}
+        #body {width:630px; margin:0; padding:5px 20px; text-align:left; background-color:#fff;}
+        #footer {width:670px; height:35px; margin:0; padding:5px 0 0 0; font-size:9pt; text-align:center; color:#fff;}
+        .ad_footer, .message, .article  {font-size:10pt; padding:0;}
+        .frm_title, .frm_txt {font-size:12pt;}
+        .frm_txt {padding-bottom:15px;}
+        .links {font-size:10pt; font-style:italic;}
+        .article_title {font-size:12pt;}
+        .dyn_content { padding-top:10px;}
+      -->
+    </style>";
+  $link = l('<img src="' . url($vars['header_image'],array('absolute' =>TRUE)) . '" border="0" alt="'.$vars['site_name'].'">', '',array('absolute' =>TRUE, 'html' =>TRUE));
+  $link = str_replace('https','http',$link);
+  $output = '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en">
+  <head>
+    '.$style.'
+    <base href="'.base_path().'" />
+  </head>
+  <body>
+    <div id="container">
+      <div id="header">' . $link .'</div>
+      <div id="body">
+        <div class="frm_txt">'.$vars['display_name'].',</div>
+        <div class="frm_txt">'.$letter.'
+        <p style="text-align: center;"><b><a href="'.$vars['receipt_url'].'">Printable Receipt</a></b></p>
+        <p>Thank you!</p></div>
+        <div><br></div>
+      </div>
+    </div>
+  </body>
+</html>';
+
+  return $output;
+}
+

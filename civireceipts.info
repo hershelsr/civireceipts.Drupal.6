@@ -1,0 +1,8 @@
+; Hershel Robinson
+name = CiviReceipts
+description = Enables users to view civireceipts as PDF.
+package = Custom Modules
+dependencies[] = tcpdf
+dependencies[] = libraries
+core = 6.x
+
